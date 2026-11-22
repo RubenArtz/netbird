@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"html"
 	"net"
 	"net/http"
 	"net/netip"
@@ -358,26 +357,49 @@ func (mw *Middleware) checkIPRestrictions(w http.ResponseWriter, r *http.Request
 	return false
 }
 
-// denyForbidden writes a 403, dropping the client connection when the
-// domain is private so a later retry cannot reuse it.
+// accessDeniedTitle and accessDeniedMessage are the static, generic strings
+// rendered for every request refused by the proxy's own access checks
+// (IP restrictions, tunnel-peer validation, account mismatch, target access
+// blocks). They deliberately carry no details about the rule, verdict,
+// country, or reputation data behind the denial; those stay in logs and
+// captured metadata. The page renderer escapes them via JSON/React, so they
+// must be plain text, never pre-escaped.
+const (
+	accessDeniedTitle   = "Access Denied"
+	accessDeniedMessage = "You are not authorized to access this service. If you believe this is a mistake, contact your administrator."
+)
+
+// denyForbidden renders the branded access-denied page with a 403, dropping
+// the client connection when the domain is private so a later retry cannot
+// reuse it.
 func denyForbidden(w http.ResponseWriter, r *http.Request, config DomainConfig) {
 	if config.Private {
 		denyPrivate(w, r)
 		return
 	}
 	markAuthRejected(r)
-	http.Error(w, "Forbidden", http.StatusForbidden)
+	web.ServeAccessDeniedPage(w, r, http.StatusForbidden, accessDeniedTitle, accessDeniedMessage, accessDeniedRequestID(r))
 }
 
-// denyPrivate writes a 403 and closes the connection, so a client refused
-// before joining the overlay cannot keep retrying on the same warm socket.
+// denyPrivate renders the branded access-denied page with a 403 and closes
+// the connection, so a client refused before joining the overlay cannot keep
+// retrying on the same warm socket.
 // Go's HTTP/2 server turns the exact lowercase "close" token into a GOAWAY.
 func denyPrivate(w http.ResponseWriter, r *http.Request) {
 	markAuthRejected(r)
 	h := w.Header()
 	h.Set("Connection", "close")
 	h.Set("Cache-Control", "no-store")
-	http.Error(w, "Forbidden", http.StatusForbidden)
+	web.ServeAccessDeniedPage(w, r, http.StatusForbidden, accessDeniedTitle, accessDeniedMessage, accessDeniedRequestID(r))
+}
+
+// accessDeniedRequestID returns the request ID for error-page correlation,
+// or empty when no captured data is attached to the request.
+func accessDeniedRequestID(r *http.Request) string {
+	if cd := proxy.CapturedDataFromContext(r.Context()); cd != nil {
+		return cd.GetRequestID()
+	}
+	return ""
 }
 
 // markAuthRejected attributes the response to the proxy's access checks, so
@@ -440,11 +462,12 @@ func (mw *Middleware) handleOAuthCallbackError(w http.ResponseWriter, r *http.Re
 		cd.SetAuthMethod(auth.MethodOIDC.String())
 		requestID = cd.GetRequestID()
 	}
+	// errDesc is passed raw: web.ServeHTTP JSON-encodes the page data and the
+	// React error page escapes it on render, so pre-escaping here would
+	// double-escape entities (e.g. "&amp;lt;").
 	errDesc := r.URL.Query().Get("error_description")
 	if errDesc == "" {
 		errDesc = "An error occurred during authentication"
-	} else {
-		errDesc = html.EscapeString(errDesc)
 	}
 	web.ServeAccessDeniedPage(w, r, http.StatusForbidden, "Access Denied", errDesc, requestID)
 	return true
